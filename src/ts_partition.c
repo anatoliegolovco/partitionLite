@@ -35,6 +35,13 @@ constexpr int  MAX_COLS              = 256;
 constexpr int  DEFAULT_LOOKBACK_DAYS = 365 * 5;
 constexpr int  CHILD_BUSY_TIMEOUT_MS = 2'000;
 
+enum : int {
+    HAS_LO   = 1 << 0,
+    HAS_HI   = 1 << 1,
+    LO_IS_GT = 1 << 2,
+    HI_IS_LT = 1 << 3,
+};
+
 static bool ts_debug_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -78,6 +85,10 @@ typedef struct Cursor {
     sqlite3        *child_db;
     sqlite3_stmt   *child_stmt;
     sqlite3_int64   rowid;
+    char           *lo_text;
+    char           *hi_text;
+    bool            lo_is_gt;
+    bool            hi_is_lt;
     bool            eof;
 } Cursor;
 
@@ -118,6 +129,19 @@ static int parse_kv(const char *arg, char **out_key, char **out_val) {
     if (vt != v) memmove(v, vt, strlen(vt) + 1);
     *out_key = k;
     *out_val = v;
+    return 1;
+}
+
+/* Parse "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS[Z]" — the first three ints are
+ * enough since we only care about the calendar day. Returns 1 on success. */
+static int parse_date(const char *s, struct tm *out) {
+    if (!s) return 0;
+    int y, m, d;
+    if (sscanf(s, "%d-%d-%d", &y, &m, &d) != 3) return 0;
+    memset(out, 0, sizeof *out);
+    out->tm_year = y - 1900;
+    out->tm_mon  = m - 1;
+    out->tm_mday = d;
     return 1;
 }
 
@@ -375,10 +399,55 @@ static int tsConnect(sqlite3 *db, [[maybe_unused]] void *aux,
     return SQLITE_OK;
 }
 
-static int tsBestIndex([[maybe_unused]] sqlite3_vtab *pVtab,
-                       sqlite3_index_info *info) {
-    info->estimatedCost = 1e9;
-    info->estimatedRows = 0;
+static int tsBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
+    Vtab *v = (Vtab*)pVtab;
+    int idxNum = 0;
+    int lo_constraint = -1;
+    int hi_constraint = -1;
+
+    for (int i = 0; i < info->nConstraint; ++i) {
+        const struct sqlite3_index_constraint *c = &info->aConstraint[i];
+        if (!c->usable) continue;
+        if (c->iColumn != v->time_col_idx) continue;
+        switch (c->op) {
+            case SQLITE_INDEX_CONSTRAINT_GT:
+                if (!(idxNum & HAS_LO)) {
+                    idxNum |= HAS_LO | LO_IS_GT;
+                    lo_constraint = i;
+                }
+                break;
+            case SQLITE_INDEX_CONSTRAINT_GE:
+                if (!(idxNum & HAS_LO)) {
+                    idxNum |= HAS_LO;
+                    lo_constraint = i;
+                }
+                break;
+            case SQLITE_INDEX_CONSTRAINT_LT:
+                if (!(idxNum & HAS_HI)) {
+                    idxNum |= HAS_HI | HI_IS_LT;
+                    hi_constraint = i;
+                }
+                break;
+            case SQLITE_INDEX_CONSTRAINT_LE:
+                if (!(idxNum & HAS_HI)) {
+                    idxNum |= HAS_HI;
+                    hi_constraint = i;
+                }
+                break;
+            default: break;
+        }
+    }
+
+    /* argv ordering: lo first, then hi. Leave omit=0 so SQLite re-checks
+     * rows: a single day's file spans the whole day and the caller's
+     * bound may be intra-day. */
+    int argv_n = 1;
+    if (lo_constraint >= 0) info->aConstraintUsage[lo_constraint].argvIndex = argv_n++;
+    if (hi_constraint >= 0) info->aConstraintUsage[hi_constraint].argvIndex = argv_n++;
+
+    info->idxNum = idxNum;
+    info->estimatedCost = (idxNum & (HAS_LO | HAS_HI)) ? 1'000.0 : 1e9;
+    info->estimatedRows = (idxNum & (HAS_LO | HAS_HI)) ? 1'000 : 1'000'000;
     return SQLITE_OK;
 }
 
@@ -417,6 +486,8 @@ static int tsClose(sqlite3_vtab_cursor *pCur) {
     Cursor *cur = (Cursor*)pCur;
     cursor_close_current(cur);
     cursor_release_files(cur);
+    sqlite3_free(cur->lo_text);
+    sqlite3_free(cur->hi_text);
     sqlite3_free(cur);
     return SQLITE_OK;
 }
@@ -481,46 +552,95 @@ static int cursor_advance(Cursor *cur) {
     }
 }
 
-/* Enumerate files for the last lookback_days, in chronological order. */
-static int enumerate_recent_files(Cursor *cur) {
+/* Enumerate files between lo and hi (inclusive), in chronological order.
+ * The span is capped at lookback_days; if the caller's range is wider we
+ * walk back from hi rather than open thousands of files. */
+static int enumerate_range(Cursor *cur, struct tm lo, struct tm hi) {
     Vtab *v = cur->vtab;
-    int cap = v->lookback_days;
-    char **list = sqlite3_malloc((int)(sizeof(char*) * cap));
+    time_t t_lo = timegm(&lo);
+    time_t t_hi = timegm(&hi);
+    if (t_lo > t_hi) {
+        cur->files = nullptr;
+        cur->n_files = 0;
+        cur->file_idx = 0;
+        DLOG("xFilter: lo>hi, empty file list");
+        return SQLITE_OK;
+    }
+    int span = (int)((t_hi - t_lo) / 86'400) + 1;
+    if (span > v->lookback_days) {
+        t_lo = t_hi - (time_t)(v->lookback_days - 1) * 86'400;
+        span = v->lookback_days;
+    }
+    char **list = sqlite3_malloc((int)(sizeof(char*) * span));
     if (!list) return SQLITE_NOMEM;
     int n = 0;
-
-    struct tm today;
-    today_utc_midnight(&today);
-    for (int i = cap - 1; i >= 0; --i) {
-        struct tm probe = today;
-        shift_days(&probe, -i);
+    for (int i = 0; i < span; ++i) {
+        time_t t = t_lo + (time_t)i * 86'400;
+        struct tm probe;
+        gmtime_r(&t, &probe);
         char *path = format_partition_path(v->dir, v->pattern, &probe);
         if (!path) continue;
         if (file_exists(path)) {
+            DLOG("xFilter: +file %s", path);
             list[n++] = path;
         } else {
+            DLOG("xFilter: -missing %s", path);
             sqlite3_free(path);
         }
     }
     cur->files = list;
     cur->n_files = n;
     cur->file_idx = 0;
-    DLOG("xFilter: discovered %d files (no bounds, lookback=%d)",
-         n, cap);
+    DLOG("xFilter: %d files of %d candidate day(s)", n, span);
     return SQLITE_OK;
 }
 
-static int tsFilter(sqlite3_vtab_cursor *pCur,
-                    [[maybe_unused]] int idxNum,
+static int tsFilter(sqlite3_vtab_cursor *pCur, int idxNum,
                     [[maybe_unused]] const char *idxStr,
-                    [[maybe_unused]] int argc,
-                    [[maybe_unused]] sqlite3_value **argv) {
+                    [[maybe_unused]] int argc, sqlite3_value **argv) {
     Cursor *cur = (Cursor*)pCur;
+    Vtab *v = cur->vtab;
+
     cursor_close_current(cur);
     cursor_release_files(cur);
+    sqlite3_free(cur->lo_text); cur->lo_text = nullptr;
+    sqlite3_free(cur->hi_text); cur->hi_text = nullptr;
+    cur->lo_is_gt = false;
+    cur->hi_is_lt = false;
     cur->rowid = 0;
     cur->eof = false;
-    int rc = enumerate_recent_files(cur);
+
+    int ai = 0;
+    if (idxNum & HAS_LO) {
+        const unsigned char *t = sqlite3_value_text(argv[ai++]);
+        if (t) cur->lo_text = sqlite3_mprintf("%s", (const char*)t);
+        cur->lo_is_gt = (idxNum & LO_IS_GT) != 0;
+    }
+    if (idxNum & HAS_HI) {
+        const unsigned char *t = sqlite3_value_text(argv[ai++]);
+        if (t) cur->hi_text = sqlite3_mprintf("%s", (const char*)t);
+        cur->hi_is_lt = (idxNum & HI_IS_LT) != 0;
+    }
+
+    /* Decide the day range to enumerate. If a bound is missing or
+     * unparseable, the open side falls back to today / lookback_days. */
+    struct tm lo_tm, hi_tm;
+    bool have_lo = cur->lo_text && parse_date(cur->lo_text, &lo_tm);
+    bool have_hi = cur->hi_text && parse_date(cur->hi_text, &hi_tm);
+    if (!have_hi) {
+        today_utc_midnight(&hi_tm);
+    }
+    if (!have_lo) {
+        lo_tm = hi_tm;
+        shift_days(&lo_tm, -(v->lookback_days - 1));
+    }
+
+    DLOG("xFilter: idxNum=0x%x lo=%s hi=%s",
+         idxNum,
+         cur->lo_text ? cur->lo_text : "<unbound>",
+         cur->hi_text ? cur->hi_text : "<unbound>");
+
+    int rc = enumerate_range(cur, lo_tm, hi_tm);
     if (rc != SQLITE_OK) return rc;
     return cursor_advance(cur);
 }

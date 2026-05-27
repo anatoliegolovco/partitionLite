@@ -512,14 +512,37 @@ static bool cursor_open_current(Cursor *cur) {
     }
     sqlite3_busy_timeout(db, CHILD_BUSY_TIMEOUT_MS);
 
+    /* Append WHERE on time_col when bounds are present so the child's
+     * index on time_col can help (and we read fewer rows per file). */
+    char *sql = sqlite3_mprintf("%s", v->select_prefix);
+    if (cur->lo_text && cur->hi_text) {
+        sql = sqlite3_mprintf("%z WHERE \"%w\" %s ? AND \"%w\" %s ?",
+                              sql,
+                              v->time_col, cur->lo_is_gt ? ">" : ">=",
+                              v->time_col, cur->hi_is_lt ? "<" : "<=");
+    } else if (cur->lo_text) {
+        sql = sqlite3_mprintf("%z WHERE \"%w\" %s ?",
+                              sql, v->time_col,
+                              cur->lo_is_gt ? ">" : ">=");
+    } else if (cur->hi_text) {
+        sql = sqlite3_mprintf("%z WHERE \"%w\" %s ?",
+                              sql, v->time_col,
+                              cur->hi_is_lt ? "<" : "<=");
+    }
+    if (!sql) { sqlite3_close(db); return false; }
+
     sqlite3_stmt *st = nullptr;
-    rc = sqlite3_prepare_v2(db, v->select_prefix, -1, &st, nullptr);
+    rc = sqlite3_prepare_v2(db, sql, -1, &st, nullptr);
+    sqlite3_free(sql);
     if (rc != SQLITE_OK) {
         DLOG("prepare(%s) failed: %s", path, sqlite3_errmsg(db));
         if (st) sqlite3_finalize(st);
         sqlite3_close(db);
         return false;
     }
+    int bind_i = 1;
+    if (cur->lo_text) sqlite3_bind_text(st, bind_i++, cur->lo_text, -1, SQLITE_TRANSIENT);
+    if (cur->hi_text) sqlite3_bind_text(st, bind_i++, cur->hi_text, -1, SQLITE_TRANSIENT);
     cur->child_db = db;
     cur->child_stmt = st;
     return true;

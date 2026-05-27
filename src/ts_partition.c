@@ -34,6 +34,7 @@ constexpr int  MAX_PATH_LEN          = 4096;
 constexpr int  MAX_COLS              = 256;
 constexpr int  DEFAULT_LOOKBACK_DAYS = 365 * 5;
 constexpr int  CHILD_BUSY_TIMEOUT_MS = 2'000;
+constexpr int  LRU_CAPACITY          = 16;
 
 enum : int {
     HAS_LO   = 1 << 0,
@@ -63,6 +64,12 @@ typedef struct ColInfo {
     char *type;
 } ColInfo;
 
+typedef struct CacheEntry {
+    char    *path;       /* nullptr == empty slot */
+    sqlite3 *db;
+    int64_t  last_used;
+} CacheEntry;
+
 typedef struct Vtab {
     sqlite3_vtab base;
     char    *dir;
@@ -74,6 +81,10 @@ typedef struct Vtab {
     int      lookback_days;
     char    *select_prefix;     /* SELECT cols FROM "child_table" */
     ColInfo  cols[MAX_COLS];
+    /* LRU of historical-file handles. Today's file is never cached: each
+     * query reopens it fresh so Grafana refreshes pick up new WAL pages. */
+    CacheEntry cache[LRU_CAPACITY];
+    int64_t    lru_clock;
 } Vtab;
 
 typedef struct Cursor {
@@ -84,6 +95,7 @@ typedef struct Cursor {
     int             file_idx;
     sqlite3        *child_db;
     sqlite3_stmt   *child_stmt;
+    bool            child_is_today;   /* if true: close on advance, don't cache */
     sqlite3_int64   rowid;
     char           *lo_text;
     char           *hi_text;
@@ -180,6 +192,68 @@ static void shift_days(struct tm *t, int ndays) {
     struct tm gt;
     gmtime_r(&base, &gt);
     *t = gt;
+}
+
+/* The path that today's partition would have, in v->dir. */
+static char *today_partition_path(const Vtab *v) {
+    struct tm today;
+    today_utc_midnight(&today);
+    return format_partition_path(v->dir, v->pattern, &today);
+}
+
+/* --- LRU cache for historical-file handles --- */
+
+/* Take an entry out of the cache if present, transferring ownership of
+ * the db handle to the caller. Returns nullptr on miss. */
+static sqlite3 *cache_take(Vtab *v, const char *path) {
+    for (int i = 0; i < LRU_CAPACITY; ++i) {
+        if (v->cache[i].path && strcmp(v->cache[i].path, path) == 0) {
+            sqlite3 *db = v->cache[i].db;
+            sqlite3_free(v->cache[i].path);
+            v->cache[i].path = nullptr;
+            v->cache[i].db = nullptr;
+            DLOG("cache hit: %s", path);
+            return db;
+        }
+    }
+    return nullptr;
+}
+
+/* Insert (path, db) into the cache, evicting the least-recently-used
+ * entry if all slots are full. Ownership of db transfers to the cache. */
+static void cache_put(Vtab *v, const char *path, sqlite3 *db) {
+    int target = -1;
+    int64_t oldest = INT64_MAX;
+    for (int i = 0; i < LRU_CAPACITY; ++i) {
+        if (!v->cache[i].path) { target = i; break; }
+        if (v->cache[i].last_used < oldest) {
+            oldest = v->cache[i].last_used;
+            target = i;
+        }
+    }
+    if (target < 0) {
+        sqlite3_close(db);
+        return;
+    }
+    if (v->cache[target].path) {
+        DLOG("cache evict: %s", v->cache[target].path);
+        sqlite3_close(v->cache[target].db);
+        sqlite3_free(v->cache[target].path);
+    }
+    v->cache[target].path = sqlite3_mprintf("%s", path);
+    v->cache[target].db = db;
+    v->cache[target].last_used = ++v->lru_clock;
+    DLOG("cache put: %s (slot %d)", path, target);
+}
+
+static void cache_release_all(Vtab *v) {
+    for (int i = 0; i < LRU_CAPACITY; ++i) {
+        if (v->cache[i].db) sqlite3_close(v->cache[i].db);
+        sqlite3_free(v->cache[i].path);
+        v->cache[i].db = nullptr;
+        v->cache[i].path = nullptr;
+        v->cache[i].last_used = 0;
+    }
 }
 
 /* --- schema sniffing --- */
@@ -299,6 +373,7 @@ static char *build_create_table_sql(const Vtab *v) {
 static int tsDisconnect(sqlite3_vtab *pVtab) {
     Vtab *v = (Vtab*)pVtab;
     if (!v) return SQLITE_OK;
+    cache_release_all(v);
     sqlite3_free(v->dir);
     sqlite3_free(v->pattern);
     sqlite3_free(v->child_table);
@@ -467,9 +542,15 @@ static void cursor_close_current(Cursor *cur) {
         cur->child_stmt = nullptr;
     }
     if (cur->child_db) {
-        sqlite3_close(cur->child_db);
+        if (cur->child_is_today) {
+            sqlite3_close(cur->child_db);
+        } else {
+            /* Hand the historical handle back to the vtab cache. */
+            cache_put(cur->vtab, cur->files[cur->file_idx], cur->child_db);
+        }
         cur->child_db = nullptr;
     }
+    cur->child_is_today = false;
 }
 
 static void cursor_release_files(Cursor *cur) {
@@ -498,19 +579,29 @@ static int tsClose(sqlite3_vtab_cursor *pCur) {
 static bool cursor_open_current(Cursor *cur) {
     Vtab *v = cur->vtab;
     const char *path = cur->files[cur->file_idx];
-    DLOG("opening partition %s", path);
 
-    sqlite3 *db = nullptr;
-    int rc = sqlite3_open_v2(path, &db,
-                             SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        DLOG("sqlite3_open_v2(%s) failed: %s",
-             path, db ? sqlite3_errmsg(db) : "(no handle)");
-        if (db) sqlite3_close(db);
-        return false;
+    /* Classify today vs historical by comparing against today's formatted
+     * path. today_path is cached on the cursor for the duration of the
+     * query so we don't keep rebuilding it. */
+    char *today_path = today_partition_path(v);
+    bool is_today = (today_path && strcmp(path, today_path) == 0);
+    sqlite3_free(today_path);
+
+    sqlite3 *db = is_today ? nullptr : cache_take(v, path);
+    if (!db) {
+        DLOG("opening partition %s%s", path, is_today ? " (today)" : "");
+        int rc = sqlite3_open_v2(path, &db,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                                 nullptr);
+        if (rc != SQLITE_OK) {
+            DLOG("sqlite3_open_v2(%s) failed: %s",
+                 path, db ? sqlite3_errmsg(db) : "(no handle)");
+            if (db) sqlite3_close(db);
+            return false;
+        }
+        sqlite3_busy_timeout(db, CHILD_BUSY_TIMEOUT_MS);
     }
-    sqlite3_busy_timeout(db, CHILD_BUSY_TIMEOUT_MS);
+    cur->child_is_today = is_today;
 
     /* Append WHERE on time_col when bounds are present so the child's
      * index on time_col can help (and we read fewer rows per file). */
@@ -532,7 +623,7 @@ static bool cursor_open_current(Cursor *cur) {
     if (!sql) { sqlite3_close(db); return false; }
 
     sqlite3_stmt *st = nullptr;
-    rc = sqlite3_prepare_v2(db, sql, -1, &st, nullptr);
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, nullptr);
     sqlite3_free(sql);
     if (rc != SQLITE_OK) {
         DLOG("prepare(%s) failed: %s", path, sqlite3_errmsg(db));

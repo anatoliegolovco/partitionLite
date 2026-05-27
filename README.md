@@ -114,6 +114,28 @@ SELECT $__timeGroup(ts, '1m') AS time, host, avg(value) AS value
 `$__timeFilter(ts)` generates a half-open `ts >= 'X' AND ts < 'Y'` clause
 which is exactly what `ts_partition`'s `xBestIndex` is looking for.
 
+## Compatibility note: which Grafana SQLite plugins can load this?
+
+Loadable SQLite extensions are a C-runtime feature. Any Grafana SQLite
+plugin that uses `mattn/go-sqlite3` (cgo, linked against libsqlite3) and
+is built with the `sqlite_load_extension` tag — and exposes a hook to
+call `LoadExtension` — can load `ts_partition`. A plugin that uses
+`modernc.org/sqlite` (a pure-Go transpilation) **cannot**: there is no C
+runtime to host the `.so`.
+
+The widely-used [`frser-sqlite-datasource`](https://github.com/fr-ser/grafana-sqlite-datasource)
+plugin switched from `mattn/go-sqlite3` to `modernc.org/sqlite` at v3.0,
+so as-shipped it does not load this extension. To use `ts_partition`
+with Grafana today you need either:
+
+- A plugin build that uses cgo SQLite with `EnableLoadExtension`, or
+- A fork of `frser-sqlite-datasource` that swaps the driver and exposes
+  an extensions config option (a few-hundred-line patch).
+
+The `bench/grafana_sim/` harness in this repo validates the same
+runtime path a cgo Grafana plugin would take — see its README for what
+it covers and how to run it.
+
 ## Caveats
 
 - **WAL needs writable directory.** Even a read-only opener needs to

@@ -18,7 +18,7 @@ LDLIBS  :=
 
 DATA_DIR := test/data
 
-.PHONY: all clean distclean fixtures test
+.PHONY: all clean distclean fixtures test bench-sim
 
 all: $(TARGET)
 
@@ -30,6 +30,9 @@ fixtures:
 
 test: $(TARGET) fixtures
 	./test/smoke_test.sh
+
+bench-sim: $(TARGET)
+	cd bench/grafana_sim && go run -tags sqlite_load_extension .
 
 clean:
 	rm -f $(TARGET) src/*.o

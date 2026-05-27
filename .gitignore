@@ -2,3 +2,5 @@
 *.so
 *.dylib
 test/data/
+bench/grafana_sim/grafana_sim
+

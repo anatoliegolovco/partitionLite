@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sqlite (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential libsqlite3-dev sqlite3
+
+      - name: Install sqlite (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sqlite
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          cc --version
+          sqlite3 --version
+
+      - name: Build
+        run: make
+
+      - name: Test
+        run: make test

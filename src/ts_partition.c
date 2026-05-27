@@ -30,11 +30,15 @@ SQLITE_EXTENSION_INIT1
 #  define TS_DEBUG_ENV "TS_PARTITION_DEBUG"
 #endif
 
-constexpr int  MAX_PATH_LEN          = 4096;
-constexpr int  MAX_COLS              = 256;
-constexpr int  DEFAULT_LOOKBACK_DAYS = 365 * 5;
-constexpr int  CHILD_BUSY_TIMEOUT_MS = 2'000;
-constexpr int  LRU_CAPACITY          = 16;
+/* Compile-time constants. Plain `constexpr int` would be the C23 idiom
+ * but Clang 18 didn't land it; enums are the portable shape. */
+enum : int {
+    MAX_PATH_LEN          = 4096,
+    MAX_COLS              = 256,
+    DEFAULT_LOOKBACK_DAYS = 365 * 5,
+    CHILD_BUSY_TIMEOUT_MS = 2'000,
+    LRU_CAPACITY          = 16,
+};
 
 enum : int {
     HAS_LO   = 1 << 0,

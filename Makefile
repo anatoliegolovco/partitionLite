@@ -25,11 +25,8 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(SHFLAGS) -o $@ $< $(LDLIBS)
 
-fixtures: $(DATA_DIR)/.stamp
-
-$(DATA_DIR)/.stamp: test/gen_fixtures.sh
+fixtures:
 	./test/gen_fixtures.sh "$(DATA_DIR)"
-	@touch $@
 
 test: $(TARGET) fixtures
 	./test/smoke_test.sh

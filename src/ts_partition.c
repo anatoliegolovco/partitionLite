@@ -37,6 +37,8 @@ enum : int {
     MAX_COLS              = 256,
     DEFAULT_LOOKBACK_DAYS = 365 * 5,
     CHILD_BUSY_TIMEOUT_MS = 2'000,
+    CHILD_BUDGET_SECONDS  = 30,
+    PROGRESS_OPS          = 10'000,
     LRU_CAPACITY          = 16,
 };
 
@@ -100,6 +102,7 @@ typedef struct Cursor {
     sqlite3        *child_db;
     sqlite3_stmt   *child_stmt;
     bool            child_is_today;   /* if true: close on advance, don't cache */
+    time_t          step_start;       /* deadline base for the progress handler */
     sqlite3_int64   rowid;
     char           *lo_text;
     char           *hi_text;
@@ -244,6 +247,10 @@ static void cache_put(Vtab *v, const char *path, sqlite3 *db) {
         sqlite3_close(v->cache[target].db);
         sqlite3_free(v->cache[target].path);
     }
+    /* The progress handler still points at the cursor we're returning from.
+     * That cursor may be freed before the next take; clear so a stale ctx
+     * can't fire under any flow. */
+    sqlite3_progress_handler(db, 0, nullptr, nullptr);
     v->cache[target].path = sqlite3_mprintf("%s", path);
     v->cache[target].db = db;
     v->cache[target].last_used = ++v->lru_clock;
@@ -577,6 +584,13 @@ static int tsClose(sqlite3_vtab_cursor *pCur) {
     return SQLITE_OK;
 }
 
+/* Whole-query budget. Returns non-zero to abort sqlite3_step in the child
+ * so a runaway scan can't pin a writer's WAL indefinitely. */
+static int progress_cb(void *ctx) {
+    Cursor *cur = (Cursor*)ctx;
+    return (time(nullptr) - cur->step_start) > CHILD_BUDGET_SECONDS ? 1 : 0;
+}
+
 /* Open the file at file_idx and prepare its child statement. Returns true
  * on success (statement ready to step); false on any failure (caller
  * should silently advance to the next file). */
@@ -606,6 +620,11 @@ static bool cursor_open_current(Cursor *cur) {
         sqlite3_busy_timeout(db, CHILD_BUSY_TIMEOUT_MS);
     }
     cur->child_is_today = is_today;
+
+    /* Re-arm the progress handler against this cursor; a cached db may have
+     * had a stale pointer from its previous owner. step_start is set once
+     * per query in tsFilter so the budget covers the whole scan. */
+    sqlite3_progress_handler(db, PROGRESS_OPS, progress_cb, cur);
 
     /* Append WHERE on time_col when bounds are present so the child's
      * index on time_col can help (and we read fewer rows per file). */
@@ -727,6 +746,7 @@ static int tsFilter(sqlite3_vtab_cursor *pCur, int idxNum,
     cur->hi_is_lt = false;
     cur->rowid = 0;
     cur->eof = false;
+    cur->step_start = time(nullptr);
 
     int ai = 0;
     if (idxNum & HAS_LO) {

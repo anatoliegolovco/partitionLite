@@ -2,10 +2,11 @@
  * ts_partition: a SQLite virtual table that transparently fans queries out
  *               across date-partitioned sibling .sqlite files in a directory.
  *
- * Read-only. Iteration of partition files lands in a later commit; for now
- * xConnect parses arguments, sniffs the child schema from the most recent
- * existing partition file (walking back up to lookback_days), and declares
- * the matching CREATE TABLE to SQLite.
+ * Read-only. xFilter enumerates partition files in the active date range,
+ * opens each READONLY, and iterates row-by-row across the list. Range
+ * push-down on time_col lands in a later commit; for now every query
+ * scans the last lookback_days. Missing partition files are silently
+ * skipped.
  */
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
@@ -64,12 +65,20 @@ typedef struct Vtab {
     int      n_cols;
     int      time_col_idx;
     int      lookback_days;
+    char    *select_prefix;     /* SELECT cols FROM "child_table" */
     ColInfo  cols[MAX_COLS];
 } Vtab;
 
 typedef struct Cursor {
     sqlite3_vtab_cursor base;
-    bool eof;
+    Vtab           *vtab;
+    char          **files;       /* malloc'd via sqlite3_mprintf */
+    int             n_files;
+    int             file_idx;
+    sqlite3        *child_db;
+    sqlite3_stmt   *child_stmt;
+    sqlite3_int64   rowid;
+    bool            eof;
 } Cursor;
 
 /* --- small string helpers --- */
@@ -227,6 +236,20 @@ static int sniff_schema(Vtab *v, const char *path, char **pzErr) {
     return SQLITE_OK;
 }
 
+/* SELECT col1, col2, ... FROM "child_table" — bounds are appended at xFilter
+ * time so we can adapt to the constraints we received. */
+static char *build_select_prefix(const Vtab *v) {
+    char *sql = sqlite3_mprintf("SELECT ");
+    if (!sql) return nullptr;
+    for (int i = 0; i < v->n_cols; ++i) {
+        const char *sep = (i + 1 < v->n_cols) ? ", " : "";
+        char *next = sqlite3_mprintf("%z\"%w\"%s", sql, v->cols[i].name, sep);
+        if (!next) return nullptr;
+        sql = next;
+    }
+    return sqlite3_mprintf("%z FROM \"%w\"", sql, v->child_table);
+}
+
 static char *build_create_table_sql(const Vtab *v) {
     char *sql = sqlite3_mprintf("CREATE TABLE x(");
     if (!sql) return nullptr;
@@ -256,6 +279,7 @@ static int tsDisconnect(sqlite3_vtab *pVtab) {
     sqlite3_free(v->pattern);
     sqlite3_free(v->child_table);
     sqlite3_free(v->time_col);
+    sqlite3_free(v->select_prefix);
     for (int i = 0; i < v->n_cols; ++i) {
         sqlite3_free(v->cols[i].name);
         sqlite3_free(v->cols[i].type);
@@ -340,6 +364,13 @@ static int tsConnect(sqlite3 *db, [[maybe_unused]] void *aux,
         return rc;
     }
 
+    v->select_prefix = build_select_prefix(v);
+    if (!v->select_prefix) {
+        *pzErr = sqlite3_mprintf("OOM building select");
+        tsDisconnect(&v->base);
+        return SQLITE_NOMEM;
+    }
+
     *ppVtab = &v->base;
     return SQLITE_OK;
 }
@@ -351,18 +382,131 @@ static int tsBestIndex([[maybe_unused]] sqlite3_vtab *pVtab,
     return SQLITE_OK;
 }
 
-static int tsOpen([[maybe_unused]] sqlite3_vtab *pVtab,
-                  sqlite3_vtab_cursor **ppCur) {
+static int tsOpen(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCur) {
     Cursor *cur = sqlite3_malloc(sizeof *cur);
     if (!cur) return SQLITE_NOMEM;
     memset(cur, 0, sizeof *cur);
+    cur->vtab = (Vtab*)pVtab;
     cur->eof = true;
     *ppCur = &cur->base;
     return SQLITE_OK;
 }
 
+static void cursor_close_current(Cursor *cur) {
+    if (cur->child_stmt) {
+        sqlite3_finalize(cur->child_stmt);
+        cur->child_stmt = nullptr;
+    }
+    if (cur->child_db) {
+        sqlite3_close(cur->child_db);
+        cur->child_db = nullptr;
+    }
+}
+
+static void cursor_release_files(Cursor *cur) {
+    if (cur->files) {
+        for (int i = 0; i < cur->n_files; ++i) sqlite3_free(cur->files[i]);
+        sqlite3_free(cur->files);
+        cur->files = nullptr;
+    }
+    cur->n_files = 0;
+    cur->file_idx = 0;
+}
+
 static int tsClose(sqlite3_vtab_cursor *pCur) {
-    sqlite3_free(pCur);
+    Cursor *cur = (Cursor*)pCur;
+    cursor_close_current(cur);
+    cursor_release_files(cur);
+    sqlite3_free(cur);
+    return SQLITE_OK;
+}
+
+/* Open the file at file_idx and prepare its child statement. Returns true
+ * on success (statement ready to step); false on any failure (caller
+ * should silently advance to the next file). */
+static bool cursor_open_current(Cursor *cur) {
+    Vtab *v = cur->vtab;
+    const char *path = cur->files[cur->file_idx];
+    DLOG("opening partition %s", path);
+
+    sqlite3 *db = nullptr;
+    int rc = sqlite3_open_v2(path, &db,
+                             SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                             nullptr);
+    if (rc != SQLITE_OK) {
+        DLOG("sqlite3_open_v2(%s) failed: %s",
+             path, db ? sqlite3_errmsg(db) : "(no handle)");
+        if (db) sqlite3_close(db);
+        return false;
+    }
+    sqlite3_busy_timeout(db, CHILD_BUSY_TIMEOUT_MS);
+
+    sqlite3_stmt *st = nullptr;
+    rc = sqlite3_prepare_v2(db, v->select_prefix, -1, &st, nullptr);
+    if (rc != SQLITE_OK) {
+        DLOG("prepare(%s) failed: %s", path, sqlite3_errmsg(db));
+        if (st) sqlite3_finalize(st);
+        sqlite3_close(db);
+        return false;
+    }
+    cur->child_db = db;
+    cur->child_stmt = st;
+    return true;
+}
+
+/* Step forward in the file list and the active statement until we land on
+ * a row or exhaust all files. */
+static int cursor_advance(Cursor *cur) {
+    while (true) {
+        if (cur->child_stmt) {
+            int rc = sqlite3_step(cur->child_stmt);
+            if (rc == SQLITE_ROW) {
+                cur->rowid++;
+                cur->eof = false;
+                return SQLITE_OK;
+            }
+            /* SQLITE_DONE or error -> close and move on. Errors are
+             * deliberately swallowed: partition reads must never propagate. */
+            cursor_close_current(cur);
+            cur->file_idx++;
+        }
+        if (cur->file_idx >= cur->n_files) {
+            cur->eof = true;
+            return SQLITE_OK;
+        }
+        if (!cursor_open_current(cur)) {
+            cur->file_idx++;
+            continue;
+        }
+    }
+}
+
+/* Enumerate files for the last lookback_days, in chronological order. */
+static int enumerate_recent_files(Cursor *cur) {
+    Vtab *v = cur->vtab;
+    int cap = v->lookback_days;
+    char **list = sqlite3_malloc((int)(sizeof(char*) * cap));
+    if (!list) return SQLITE_NOMEM;
+    int n = 0;
+
+    struct tm today;
+    today_utc_midnight(&today);
+    for (int i = cap - 1; i >= 0; --i) {
+        struct tm probe = today;
+        shift_days(&probe, -i);
+        char *path = format_partition_path(v->dir, v->pattern, &probe);
+        if (!path) continue;
+        if (file_exists(path)) {
+            list[n++] = path;
+        } else {
+            sqlite3_free(path);
+        }
+    }
+    cur->files = list;
+    cur->n_files = n;
+    cur->file_idx = 0;
+    DLOG("xFilter: discovered %d files (no bounds, lookback=%d)",
+         n, cap);
     return SQLITE_OK;
 }
 
@@ -371,29 +515,36 @@ static int tsFilter(sqlite3_vtab_cursor *pCur,
                     [[maybe_unused]] const char *idxStr,
                     [[maybe_unused]] int argc,
                     [[maybe_unused]] sqlite3_value **argv) {
-    ((Cursor*)pCur)->eof = true;
-    return SQLITE_OK;
+    Cursor *cur = (Cursor*)pCur;
+    cursor_close_current(cur);
+    cursor_release_files(cur);
+    cur->rowid = 0;
+    cur->eof = false;
+    int rc = enumerate_recent_files(cur);
+    if (rc != SQLITE_OK) return rc;
+    return cursor_advance(cur);
 }
 
 static int tsNext(sqlite3_vtab_cursor *pCur) {
-    ((Cursor*)pCur)->eof = true;
-    return SQLITE_OK;
+    return cursor_advance((Cursor*)pCur);
 }
 
 static int tsEof(sqlite3_vtab_cursor *pCur) {
     return ((Cursor*)pCur)->eof ? 1 : 0;
 }
 
-static int tsColumn([[maybe_unused]] sqlite3_vtab_cursor *pCur,
-                    sqlite3_context *ctx,
-                    [[maybe_unused]] int col) {
-    sqlite3_result_null(ctx);
+static int tsColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col) {
+    Cursor *cur = (Cursor*)pCur;
+    if (!cur->child_stmt || col < 0 || col >= cur->vtab->n_cols) {
+        sqlite3_result_null(ctx);
+        return SQLITE_OK;
+    }
+    sqlite3_result_value(ctx, sqlite3_column_value(cur->child_stmt, col));
     return SQLITE_OK;
 }
 
-static int tsRowid([[maybe_unused]] sqlite3_vtab_cursor *pCur,
-                   sqlite3_int64 *pRowid) {
-    *pRowid = 0;
+static int tsRowid(sqlite3_vtab_cursor *pCur, sqlite3_int64 *pRowid) {
+    *pRowid = ((Cursor*)pCur)->rowid;
     return SQLITE_OK;
 }
 

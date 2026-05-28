@@ -26,44 +26,76 @@ jobs:
         run: |
           set -x
           brew list sqlite >/dev/null 2>&1 || brew install sqlite
-          # brew installs sqlite as keg-only because macOS ships its own.
-          # Apple's stock sqlite3 is built without SQLITE_ENABLE_LOAD_EXTENSION,
-          # so `.load` fails. Put brew's binaries first on PATH so the smoke
-          # test picks up the extension-capable build.
           SQLITE_PREFIX="$(brew --prefix sqlite)"
-          echo "SQLITE_PREFIX=$SQLITE_PREFIX"
-          ls -la "$SQLITE_PREFIX/bin"
           echo "$SQLITE_PREFIX/bin" >> "$GITHUB_PATH"
-          # Headers / libs for the build to link against brew's sqlite, in
-          # case Apple's SDK sqlite3.h is missing something we need.
-          echo "CFLAGS_EXTRA=-I$SQLITE_PREFIX/include" >> "$GITHUB_ENV"
+          {
+            echo "## Install sqlite (macOS)"
+            echo "- SQLITE_PREFIX: \`$SQLITE_PREFIX\`"
+            echo "- bin contents:"
+            echo '```'
+            ls -la "$SQLITE_PREFIX/bin" 2>&1 || echo "(no bin dir at $SQLITE_PREFIX/bin)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Show toolchain
+      - name: Diagnose toolchain
         run: |
-          set -x
-          uname -a
-          cc --version | head -3
-          echo "PATH=$PATH"
-          which sqlite3
-          sqlite3 --version
-          # If the binary in PATH supports load_extension, this is silent.
-          # If it doesn't, sqlite3 will print "Error: not authorized" or
-          # "unknown command: load_extension" and exit non-zero — which
-          # surfaces the actual diagnostic right here in the log.
-          sqlite3 :memory: "SELECT load_extension('/nonexistent') IS NULL;" \
-              2>&1 | head -5 || true
-          # The above probe is expected to error on a missing path; the
-          # important signal is *what kind* of error it returns.
+          set +e
+          {
+            echo "## Toolchain (${{ runner.os }})"
+            echo "- uname: \`$(uname -a)\`"
+            echo "- cc: \`$(cc --version 2>&1 | head -1)\`"
+            echo "- PATH: \`$PATH\`"
+            echo "- which sqlite3: \`$(which sqlite3)\`"
+            echo "- sqlite3 --version: \`$(sqlite3 --version 2>&1)\`"
+            echo
+            echo "### load_extension probe"
+            echo '```'
+            sqlite3 :memory: \
+              "SELECT load_extension('/tmp/__nonexistent__.so') IS NULL;" 2>&1
+            ec=$?
+            echo "(exit $ec)"
+            echo '```'
+            echo
+            echo "### .load probe via dot-command"
+            echo '```'
+            sqlite3 :memory: ".load /tmp/__nonexistent__.so" 2>&1
+            ec=$?
+            echo "(exit $ec)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build
         run: |
           set -x
-          make
-          # Show what got built — if .so/.dylib is missing the test will
-          # bail with "extension not built", and we want to spot that here.
-          ls -la ts_partition.* || true
+          make 2>&1 | tee /tmp/build.log
+          ec=${PIPESTATUS[0]}
+          {
+            echo "## Build (${{ runner.os }})"
+            echo '```'
+            tail -50 /tmp/build.log
+            echo "(exit $ec)"
+            echo '```'
+            echo
+            echo "### artifacts"
+            echo '```'
+            ls -la ts_partition.* 2>&1 || echo "(no ts_partition.* in $(pwd))"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$ec"
 
       - name: Test
         run: |
           set -x
-          make test
+          set +e
+          make test 2>&1 | tee /tmp/test.log
+          ec=${PIPESTATUS[0]}
+          {
+            echo "## Test (${{ runner.os }})"
+            echo "exit: $ec"
+            echo
+            echo "### tail of test output"
+            echo '```'
+            tail -80 /tmp/test.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$ec"

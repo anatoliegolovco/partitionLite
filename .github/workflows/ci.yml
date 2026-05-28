@@ -23,12 +23,20 @@ jobs:
 
       - name: Install sqlite (macOS)
         if: runner.os == 'macOS'
-        run: brew install sqlite
+        run: |
+          brew install sqlite
+          # brew installs sqlite as keg-only because macOS ships its own.
+          # Apple's stock sqlite3 is built without SQLITE_ENABLE_LOAD_EXTENSION,
+          # so `.load` fails. Put brew's binaries first on PATH so the smoke
+          # test (and the toolchain probe below) actually picks up the
+          # extension-capable build.
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
 
       - name: Show toolchain
         run: |
           uname -a
           cc --version
+          which sqlite3
           sqlite3 --version
 
       - name: Build

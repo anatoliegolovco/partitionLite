@@ -1,0 +1,64 @@
+===== uname / cc =====
+Darwin sat12-dp151-f9f90cff-c1d0-4430-8625-5507606c12c0-8E7101C0CB4D.local 24.6.0 Darwin Kernel Version 24.6.0: Tue Apr 21 20:18:00 PDT 2026; root:xnu-11417.140.69.710.16~1/RELEASE_ARM64_VMAPPLE arm64
+Apple clang version 17.0.0 (clang-1700.0.13.5)
+Target: arm64-apple-darwin24.6.0
+Thread model: posix
+
+===== PATH =====
+/opt/homebrew/opt/sqlite/bin:/opt/homebrew/lib/ruby/gems/3.3.0/bin:/opt/homebrew/opt/ruby@3.3/bin:/Users/runner/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/Users/runner/.cargo/bin:/usr/local/opt/curl/bin:/usr/local/bin:/usr/local/sbin:/Users/runner/bin:/Users/runner/.yarn/bin:/Users/runner/Library/Android/sdk/tools:/Users/runner/Library/Android/sdk/platform-tools:/Library/Frameworks/Python.framework/Versions/Current/bin:/Library/Frameworks/Mono.framework/Versions/Current/Commands:/usr/bin:/bin:/usr/sbin:/sbin:/Users/runner/.dotnet/tools
+
+===== sqlite3 location =====
+/opt/homebrew/opt/sqlite/bin/sqlite3
+3.53.1 2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9 (64-bit)
+
+===== load_extension probe (SQL function) =====
+Error in 2nd command line argument: dlopen(/tmp/__nope__.so.dylib, 0x000A): tried: '/tmp/__nope__.so.dylib' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/tmp/__nope__.so.dylib' (no such file), '/tmp/__nope__.so.dylib' (no such file), '/private/tmp/__nope__.so.dylib' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/private/tmp/__nope__.
+(exit 1)
+
+===== .load probe (dot-command) =====
+Error: dlopen(/tmp/__nope__.so.dylib, 0x000A): tried: '/tmp/__nope__.so.dylib' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/tmp/__nope__.so.dylib' (no such file), '/tmp/__nope__.so.dylib' (no such file), '/private/tmp/__nope__.so.dylib' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/private/tmp/__nope__.
+(exit 1)
+
+===== make (build) =====
+cc -std=c23 -O2 -Wall -Wextra -Wpedantic -fPIC -fvisibility=hidden -dynamiclib -undefined dynamic_lookup -o ts_partition.dylib src/ts_partition.c 
+(build exit 0)
+
+===== artifacts =====
+-rwxr-xr-x  1 runner  staff  52848 May 28 08:19 ts_partition.dylib
+
+===== make test =====
+./test/gen_fixtures.sh "test/data"
+  wrote test/data/metrics_2026-05-18.sqlite
+  wrote test/data/metrics_2026-05-19.sqlite
+  wrote test/data/metrics_2026-05-21.sqlite
+  wrote test/data/metrics_2026-05-22.sqlite
+fixtures: 4 files in test/data (day -8 deliberately missing)
+./test/smoke_test.sh
+ok   count across all days
+ok   range crosses missing day
+ok   single-day query
+ok   non-time predicate
+ok   distinct hosts
+Parse error in 4th command line argument: no such column: "|" - should this be a string literal in single-quotes?
+  SELECT min(value)||"|"||max(value) FROM m;
+                     ^--- error here
+FAIL min/max value
+     expected: 6.1|10.4
+     got:      
+ok   range outside data
+Parse error in 4th command line argument: no such column: "|" - should this be a string literal in single-quotes?
+  SELECT name||"|"||type FROM pragma_table_info("m");
+               ^--- error here
+FAIL declared schema
+     expected: ts|TEXT
+host|TEXT
+value|REAL
+     got:      
+ok   intra-day push-down
+ok   half-open across gap
+ok   cache hit on repeat
+
+9 passed, 2 failed
+make: *** [test] Error 1
+(test exit 2)
+STAGE=test ec=2

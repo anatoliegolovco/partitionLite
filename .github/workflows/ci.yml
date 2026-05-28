@@ -11,8 +11,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -27,76 +25,20 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew list sqlite >/dev/null 2>&1 || brew install sqlite
-          SQLITE_PREFIX="$(brew --prefix sqlite)"
-          echo "$SQLITE_PREFIX/bin" >> "$GITHUB_PATH"
-          echo "SQLITE_PREFIX=$SQLITE_PREFIX" >> "$GITHUB_ENV"
+          # brew installs sqlite as keg-only because macOS ships its own.
+          # Put brew's binaries first on PATH so the smoke test picks up the
+          # newer, extension-capable build instead of Apple's stock CLI.
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
 
-      - name: Run pipeline (capturing all output)
-        id: pipeline
+      - name: Show toolchain
         run: |
-          set +e
-          {
-            echo "===== uname / cc ====="
-            uname -a
-            cc --version | head -3
-            echo
-            echo "===== PATH ====="
-            echo "$PATH"
-            echo
-            echo "===== sqlite3 location ====="
-            which sqlite3
-            sqlite3 --version
-            echo
-            echo "===== load_extension probe (SQL function) ====="
-            sqlite3 :memory: \
-              "SELECT load_extension('/tmp/__nope__.so') IS NULL;" 2>&1
-            echo "(exit $?)"
-            echo
-            echo "===== .load probe (dot-command) ====="
-            sqlite3 :memory: ".load /tmp/__nope__.so" 2>&1
-            echo "(exit $?)"
-            echo
-            echo "===== make (build) ====="
-            make
-            BUILD_EC=$?
-            echo "(build exit $BUILD_EC)"
-            echo
-            echo "===== artifacts ====="
-            ls -la ts_partition.* 2>&1 || echo "(no artifact)"
-            echo
-            if [ "$BUILD_EC" -ne 0 ]; then
-              echo "STAGE=build FAILED ec=$BUILD_EC"
-              exit "$BUILD_EC"
-            fi
-            echo "===== make test ====="
-            make test
-            TEST_EC=$?
-            echo "(test exit $TEST_EC)"
-            echo "STAGE=test ec=$TEST_EC"
-            exit "$TEST_EC"
-          } 2>&1 | tee /tmp/diag.log
-          exit "${PIPESTATUS[0]}"
+          uname -a
+          cc --version | head -1
+          which sqlite3
+          sqlite3 --version
 
-      - name: Publish diagnostics on failure
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eux
-          BRANCH="ci-diag-${{ matrix.os }}"
-          REL_PATH="${{ matrix.os }}.log"
+      - name: Build
+        run: make
 
-          # Build a one-file orphan branch via git plumbing — no checkout.
-          git config user.email "ci-diag@noreply.localhost"
-          git config user.name  "ci-diag-bot"
-
-          BLOB=$(git hash-object -w /tmp/diag.log)
-          TREE=$(printf "100644 blob %s\t%s\n" "$BLOB" "$REL_PATH" | git mktree)
-          COMMIT=$(GIT_AUTHOR_NAME=ci-diag-bot \
-                   GIT_AUTHOR_EMAIL=ci-diag@noreply.localhost \
-                   GIT_COMMITTER_NAME=ci-diag-bot \
-                   GIT_COMMITTER_EMAIL=ci-diag@noreply.localhost \
-                   git commit-tree "$TREE" \
-                       -m "ci-diag ${{ matrix.os }} run ${{ github.run_id }} sha ${{ github.sha }}")
-          git push origin "$COMMIT:refs/heads/$BRANCH" --force
-          echo "Pushed diagnostics to branch: $BRANCH"
+      - name: Test
+        run: make test

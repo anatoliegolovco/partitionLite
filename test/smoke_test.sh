@@ -75,7 +75,7 @@ web-2" \
     "$(q "SELECT DISTINCT host FROM m ORDER BY host;")"
 
 check "min/max value" "6.1|10.4" \
-    "$(q 'SELECT min(value)||"|"||max(value) FROM m;')"
+    "$(q "SELECT min(value)||'|'||max(value) FROM m;")"
 
 # 6. Range entirely outside any data → zero rows, no error
 check "range outside data" 0 \
@@ -85,7 +85,7 @@ check "range outside data" 0 \
 check "declared schema" "ts|TEXT
 host|TEXT
 value|REAL" \
-    "$(q 'SELECT name||"|"||type FROM pragma_table_info("m");')"
+    "$(q "SELECT name||'|'||type FROM pragma_table_info('m');")"
 
 # 8. Intra-day bound returns the right slice within one day file
 check "intra-day push-down" 2 \

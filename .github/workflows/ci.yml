@@ -24,23 +24,46 @@ jobs:
       - name: Install sqlite (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install sqlite
+          set -x
+          brew list sqlite >/dev/null 2>&1 || brew install sqlite
           # brew installs sqlite as keg-only because macOS ships its own.
           # Apple's stock sqlite3 is built without SQLITE_ENABLE_LOAD_EXTENSION,
           # so `.load` fails. Put brew's binaries first on PATH so the smoke
-          # test (and the toolchain probe below) actually picks up the
-          # extension-capable build.
-          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+          # test picks up the extension-capable build.
+          SQLITE_PREFIX="$(brew --prefix sqlite)"
+          echo "SQLITE_PREFIX=$SQLITE_PREFIX"
+          ls -la "$SQLITE_PREFIX/bin"
+          echo "$SQLITE_PREFIX/bin" >> "$GITHUB_PATH"
+          # Headers / libs for the build to link against brew's sqlite, in
+          # case Apple's SDK sqlite3.h is missing something we need.
+          echo "CFLAGS_EXTRA=-I$SQLITE_PREFIX/include" >> "$GITHUB_ENV"
 
       - name: Show toolchain
         run: |
+          set -x
           uname -a
-          cc --version
+          cc --version | head -3
+          echo "PATH=$PATH"
           which sqlite3
           sqlite3 --version
+          # If the binary in PATH supports load_extension, this is silent.
+          # If it doesn't, sqlite3 will print "Error: not authorized" or
+          # "unknown command: load_extension" and exit non-zero — which
+          # surfaces the actual diagnostic right here in the log.
+          sqlite3 :memory: "SELECT load_extension('/nonexistent') IS NULL;" \
+              2>&1 | head -5 || true
+          # The above probe is expected to error on a missing path; the
+          # important signal is *what kind* of error it returns.
 
       - name: Build
-        run: make
+        run: |
+          set -x
+          make
+          # Show what got built — if .so/.dylib is missing the test will
+          # bail with "extension not built", and we want to spot that here.
+          ls -la ts_partition.* || true
 
       - name: Test
-        run: make test
+        run: |
+          set -x
+          make test

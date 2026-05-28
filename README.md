@@ -172,3 +172,11 @@ it covers and how to run it.
 ## License
 
 MIT. See `LICENSE`.
+
+## Deeper reading
+
+Design and routing internals are documented under [`docs/`](./docs/):
+
+- [`docs/architecture.md`](./docs/architecture.md) — component layout, class diagram, query lifecycle, cursor state machine.
+- [`docs/sql-routing.md`](./docs/sql-routing.md) — how one `SELECT` becomes N child `SELECT`s; xBestIndex / xFilter / cursor-advance flows.
+- [`docs/design-decisions.md`](./docs/design-decisions.md) — why each non-obvious choice was made.
